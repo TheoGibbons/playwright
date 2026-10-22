@@ -1,0 +1,23 @@
+{
+  "name": "render-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Authenticated HTTP API that renders a URL in headless Chromium and returns a screenshot, PDF or HTML.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "@ghostery/adblocker-playwright": "2.20.1",
+    "fastify": "5.12.7",
+    "fflate": "0.8.3",
+    "ipaddr.js": "2.5.0",
+    "playwright": "1.64.1",
+    "sharp": "0.35.5"
+  }
+}

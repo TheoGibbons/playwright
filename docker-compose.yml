@@ -1,0 +1,40 @@
+services:
+  render:
+    build: .
+    image: render-service
+    restart: unless-stopped
+    env_file: .env
+    # Published for direct access / testing. With the Caddy profile below you
+    # can bind it to localhost only ("127.0.0.1:3000:3000") so only Caddy is public.
+    ports:
+      - "${RENDER_PORT:-3000}:3000"
+    shm_size: 1gb
+    mem_limit: 2g
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 70s # lets in-flight renders (JOB_TIMEOUT_MS) finish
+
+  # Optional HTTPS front door with automatic Let's Encrypt certificates:
+  #   docker compose --profile tls up -d
+  caddy:
+    image: caddy:2
+    profiles: [tls]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - render
+
+volumes:
+  caddy_data:
