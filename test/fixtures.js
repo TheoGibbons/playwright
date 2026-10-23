@@ -66,6 +66,16 @@ const pages = {
     <pre id="headers">${escape(JSON.stringify(req.headers))}</pre>
     <img src="http://localhost:${port}/pixel">`,
 
+  // What a bot check sees: the User-Agent header and what scripts can read.
+  '/identity': (q, req) => `<!doctype html><pre id="identity"></pre>
+    <script>
+      document.getElementById('identity').textContent = JSON.stringify({
+        header: ${JSON.stringify(req.headers['user-agent'] ?? '')},
+        userAgent: navigator.userAgent,
+        webdriver: navigator.webdriver,
+      });
+    </script>`,
+
   '/cookies': (q, req) => `<!doctype html><pre id="cookie">${escape(req.headers.cookie ?? '')}</pre>`,
 
   '/hidden': () => `<!doctype html><div class="banner">COOKIE BANNER</div><p>body text</p>`,

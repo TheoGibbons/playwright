@@ -180,7 +180,7 @@ Authenticate with `Authorization: Bearer <key>` or `X-API-Key: <key>`. Only `url
   "headers": { "Authorization": "..." }, // sent to the target's origin only
   "cookies": [{ "name": "session", "value": "abc" }],
   "colorScheme": "light",        // light | dark | no-preference
-  "userAgent": "...",
+  "userAgent": "...",            // default: Chromium's own, without "Headless" (see Known limitations)
 
   "pdf": { "paper": "A4", "landscape": false, "margin": "10mm", "media": "screen", "scale": 1, "printBackground": true },
   "html": { "baseHref": true }   // inject <base> so relative links work offline
@@ -319,5 +319,5 @@ docker run --rm --read-only --tmpfs /tmp --shm-size 1g -v "$PWD/test:/app/test:r
 
 - **Inner scroll containers.** Apps that scroll an inner element instead of the page (`body { height: 100vh; overflow: hidden }`) only produce a viewport-sized "full page", and the same goes for PDF. A taller `viewport.height` (up to 4320) is the practical workaround.
 - **Width.** Full-page screenshots are the viewport's width; content that overflows sideways is cut off.
-- **Bot protection.** Some sites (Cloudflare challenges and similar) block headless browsers. You'll get the challenge page, usually with a 403 in `X-Upstream-Status`.
+- **Bot protection.** Some sites (Cloudflare challenges and similar) block automated browsers. You'll get the challenge page, usually with a 403 in `X-Upstream-Status`. The service removes the two plainest signs: the user agent says `Chrome` rather than `HeadlessChrome`, and `navigator.webdriver` is `false`. Other signs remain, and running Chromium with a window (under Xvfb) would not remove them: the server's datacenter IP address, WebGL rendered in software (SwiftShader), and traces of the automation protocol. If you set `userAgent` yourself, match the real browser. Use Chrome's shortened form (`Chrome/<major>.0.0.0`) with the same major version, because pages also receive `Sec-CH-UA` client hints that name the real version.
 - **Fonts.** The image covers Latin, CJK, Thai, emoji and most Noto scripts. Add packages to the Dockerfile if you need others.

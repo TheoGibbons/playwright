@@ -250,6 +250,27 @@ describe('render API', () => {
       assert.match(await res.text(), /session=abc123/);
     });
   });
+
+  describe('browser identity', () => {
+    const identity = async (body = {}) => {
+      const res = await svc.post({ url: fixtures.url('/identity'), format: 'html', wait: { until: 'load' }, ...body });
+      return JSON.parse(/<pre id="identity">(.*?)<\/pre>/.exec(await res.text())[1]);
+    };
+
+    test('does not announce itself as headless or automated', async () => {
+      const seen = await identity();
+      assert.doesNotMatch(seen.header, /Headless/);
+      assert.match(seen.header, / Chrome\/\d+\.0\.0\.0 /);
+      assert.equal(seen.userAgent, seen.header);
+      assert.equal(seen.webdriver, false);
+    });
+
+    test('a userAgent in the request replaces the default', async () => {
+      const seen = await identity({ userAgent: 'custom-agent/1.0' });
+      assert.equal(seen.header, 'custom-agent/1.0');
+      assert.equal(seen.userAgent, 'custom-agent/1.0');
+    });
+  });
 });
 
 describe('egress policy through the API', () => {

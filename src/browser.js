@@ -42,7 +42,8 @@ export class BrowserManager {
       entry.active++;
       let context;
       try {
-        context = await entry.browser.newContext(options);
+        // A userAgent in `options` replaces the default.
+        context = await entry.browser.newContext({ userAgent: entry.userAgent, ...options });
       } catch (err) {
         this.#done(entry);
         throw err;
@@ -97,9 +98,19 @@ export class BrowserManager {
         // Keep every byte on the proxied path.
         '--disable-quic',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+        // Bot checks read navigator.webdriver. This makes it false, as it is
+        // in a browser a person is using.
+        '--disable-blink-features=AutomationControlled',
       ],
     });
-    const entry = { browser, active: 0, served: 0, retiring: false };
+    let userAgent;
+    try {
+      userAgent = await regularUserAgent(browser);
+    } catch (err) {
+      await browser.close().catch(() => {});
+      throw err;
+    }
+    const entry = { browser, userAgent, active: 0, served: 0, retiring: false };
     browser.on('disconnected', () => {
       if (this.#current === entry) {
         this.#current = null;
@@ -138,5 +149,20 @@ export class BrowserManager {
   #clearIdleTimer() {
     clearTimeout(this.#idleTimer);
     this.#idleTimer = null;
+  }
+}
+
+/**
+ * Chromium's own user agent with "HeadlessChrome" changed to "Chrome". That
+ * word is the only difference from the same browser run with a window, and bot
+ * checks match on it.
+ */
+async function regularUserAgent(browser) {
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    const { userAgent } = await cdp.send('Browser.getVersion');
+    return userAgent.replace('HeadlessChrome/', 'Chrome/');
+  } finally {
+    await cdp.detach().catch(() => {});
   }
 }
