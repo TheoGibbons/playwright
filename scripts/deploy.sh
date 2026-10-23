@@ -113,14 +113,31 @@ image="$registry/$repository:$(git rev-parse HEAD)"
 # that build attestations would wrap the image in.
 docker build --platform linux/amd64 --provenance=false --sbom=false -t "$image" .
 
-# Start the image the way Lambda will: its entrypoint (ImageConfig in
-# infra/app.yml), a read-only root with only /tmp writable, no /dev/shm, a user
-# that is not in /etc/passwd and no capabilities. /healthz answers only once
-# Chromium has launched, so this catches a broken browser install before
-# anything is pushed.
+# Run the image the way Lambda will before pushing it: its entrypoint
+# (ImageConfig in infra/app.yml), a read-only root with only /tmp writable, no
+# /dev/shm, a user that is not in /etc/passwd, no capabilities, and the system
+# calls Lambda refuses refused: capset(), which Chromium's zygote makes in every
+# child, and registering as a subreaper (prctl 36), which tini -s makes. Then
+# render a page served inside the container, so a browser that launches but
+# crashes on its first page fails here too.
+seccomp="$(mktemp)"
+smoke=
+trap 'rm -f "$seccomp"; if [[ -n $smoke ]]; then docker rm -f "$smoke" >/dev/null 2>&1 || true; fi' EXIT
+cat > "$seccomp" <<'EOF'
+{"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [
+  {"names": ["capset"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1},
+  {"names": ["prctl"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1,
+   "args": [{"index": 0, "value": 36, "op": "SCMP_CMP_EQ"}]}
+]}
+EOF
+# no-new-privileges makes runc apply the profile last, after it has used capset
+# itself to set up the container.
 smoke="$(docker run -d --read-only --tmpfs /tmp --ipc none --user 993:990 --cap-drop ALL \
-  -e API_KEYS=smoke-test-key-0123456789 -e HOME=/tmp --entrypoint node "$image" src/server.js)"
-trap 'docker rm -f "$smoke" >/dev/null 2>&1 || true' EXIT
+  --security-opt no-new-privileges --security-opt "seccomp=$seccomp" \
+  -e API_KEYS=smoke-test-key-0123456789 -e HOME=/tmp -e ALLOW_PRIVATE_NETWORKS=true \
+  --entrypoint node "$image" src/server.js)"
+docker exec -d "$smoke" node -e \
+  "require('node:http').createServer((req, res) => res.end('<h1>smoke test</h1>')).listen(8080, '127.0.0.1')"
 probe="fetch('http://127.0.0.1:3000/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 for ((i = 1; ; i++)); do
   if docker exec "$smoke" node -e "$probe" 2>/dev/null; then
@@ -133,8 +150,21 @@ for ((i = 1; ; i++)); do
   fi
   sleep 1
 done
+render="fetch('http://127.0.0.1:3000/render', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-api-key': 'smoke-test-key-0123456789' },
+  body: JSON.stringify({ url: 'http://127.0.0.1:8080/' }),
+}).then(async (r) => {
+  if (r.headers.get('content-type') !== 'image/png') throw new Error(r.status + ' ' + (await r.text()));
+})"
+if ! docker exec "$smoke" node -e "$render"; then
+  echo "The image starts but cannot render a page; nothing was deployed. Its log:" >&2
+  docker logs "$smoke" >&2 || true
+  exit 1
+fi
 docker rm -f "$smoke" >/dev/null
-echo "The image starts and launches Chromium."
+smoke=
+echo "The image starts and renders a page."
 
 aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
 docker push "$image"

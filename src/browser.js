@@ -101,6 +101,11 @@ export class BrowserManager {
         // Bot checks read navigator.webdriver. This makes it false, as it is
         // in a browser a person is using.
         '--disable-blink-features=AutomationControlled',
+        // The zygote has every process it forks drop its capabilities with
+        // capset(), which Lambda refuses, so each renderer crashed there.
+        // Without the sandbox it buys nothing, so launch processes directly,
+        // in Docker too, where the tests then cover what Lambda runs.
+        ...(this.sandbox ? [] : ['--no-zygote']),
       ],
     });
     let userAgent;
