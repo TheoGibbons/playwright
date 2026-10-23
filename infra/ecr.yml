@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Image repository for the render service. It is its own stack because the
+  image has to be pushed before the function that runs it can exist; deployed
+  by scripts/deploy.sh as stack playwright-ecr.
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: playwright
+      EmptyOnDelete: true
+      # Images are tagged with their commit. Three covers the running release and
+      # a rollback; each one is storage the spend limit pays for.
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules": [{"rulePriority": 1, "description": "Keep the three newest images",
+          "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 3},
+          "action": {"type": "expire"}}]}
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaPull
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              StringLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri

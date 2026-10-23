@@ -4,6 +4,7 @@
 node_modules
 test
 scripts
+infra
 *.md
 .env
 .env.*

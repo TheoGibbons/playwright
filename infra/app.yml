@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Render service on AWS Lambda behind CloudFront, with a monthly spend limit
+  that switches it off. Deployed by scripts/deploy.sh as stack playwright, in
+  us-east-1; see README.md.
+
+# Every optional parameter is blank by default and blank means the default, so
+# deleting a line from .env.production and deploying puts the default back.
+Parameters:
+  ImageUri:
+    Type: String
+    Description: Container image to run. Set by scripts/deploy.sh.
+  ApiKeys:
+    Type: String
+    NoEcho: true
+    Description: Comma-separated API keys, each at least 16 characters.
+  DomainName:
+    Type: String
+    Description: Public hostname, e.g. playwright.sinkmailer.com.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone holding DomainName, used to validate its certificate.
+  MonthlyBudgetUsd:
+    Type: String
+    Default: ''
+    Description: Monthly spend, in USD, at which the API is switched off. Default 5.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional address for budget alerts at 80% and 100%.
+  MaxInstances:
+    Type: String
+    Default: ''
+    Description: Lambda instances that may run at once. Default 2.
+  MemoryMb:
+    Type: String
+    Default: ''
+    Description: Memory per instance in MB; CPU scales with it. Default 2048.
+  WebAclArn:
+    Type: String
+    Default: ''
+    Description: Optional AWS WAF web ACL for the distribution (CloudFront flat-rate plans attach one).
+  JobTimeoutMs:
+    Type: String
+    Default: ''
+  NavigationTimeoutMs:
+    Type: String
+    Default: ''
+  MaxImageHeight:
+    Type: String
+    Default: ''
+  MaxCaptureHeight:
+    Type: String
+    Default: ''
+  BrowserRecycleAfter:
+    Type: String
+    Default: ''
+  LogLevel:
+    Type: String
+    Default: ''
+
+Conditions:
+  DefaultBudget: !Equals [!Ref MonthlyBudgetUsd, '']
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  DefaultMaxInstances: !Equals [!Ref MaxInstances, '']
+  DefaultMemory: !Equals [!Ref MemoryMb, '']
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, '']]
+  DefaultJobTimeout: !Equals [!Ref JobTimeoutMs, '']
+
+Resources:
+  # --- The render function ----------------------------------------------------
+
+  RenderLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/playwright-render
+      RetentionInDays: 14
+
+  # The function renders untrusted pages, so its role can do nothing but write
+  # its own logs.
+  RenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt RenderLogs.Arn
+
+  RenderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: playwright-render
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures: [x86_64]
+      Role: !GetAtt RenderRole.Arn
+      MemorySize: !If [DefaultMemory, 2048, !Ref MemoryMb]
+      # A render stops at JOB_TIMEOUT_MS. The rest covers a cold start and
+      # streaming a large result back.
+      Timeout: 90
+      EphemeralStorage:
+        Size: 1024
+      # Each instance renders one page at a time, so this is the concurrency
+      # limit, and the most that can be spent per hour. The spend guard below
+      # sets it to 0 and back.
+      ReservedConcurrentExecutions: !If [DefaultMaxInstances, 2, !Ref MaxInstances]
+      LoggingConfig:
+        LogGroup: !Ref RenderLogs
+      Environment:
+        Variables:
+          API_KEYS: !Ref ApiKeys
+          HOME: /tmp
+          # CloudFront gives up on the origin after 60 seconds (OriginReadTimeout
+          # below), so a render has to answer before that, cold start included.
+          JOB_TIMEOUT_MS: !If [DefaultJobTimeout, '50000', !Ref JobTimeoutMs]
+          # Lambda freezes an instance between requests and does not bill it
+          # while frozen, so there is nothing to gain from closing Chromium, and
+          # a timer that fires on thaw would only make the next request wait.
+          IDLE_SHUTDOWN_MS: '0'
+          NAVIGATION_TIMEOUT_MS: !Ref NavigationTimeoutMs
+          MAX_IMAGE_HEIGHT: !Ref MaxImageHeight
+          MAX_CAPTURE_HEIGHT: !Ref MaxCaptureHeight
+          BROWSER_RECYCLE_AFTER: !Ref BrowserRecycleAfter
+          LOG_LEVEL: !Ref LogLevel
+          # Deliberately absent: ALLOW_PRIVATE_NETWORKS would let pages reach the
+          # Lambda Runtime API on 127.0.0.1:9001 and take over invocations, and
+          # Lambda cannot run Chromium's sandbox, so CHROMIUM_SANDBOX stays off.
+          # MAX_CONCURRENCY and MAX_QUEUE do nothing here: Lambda hands each
+          # instance one request at a time.
+          AWS_LWA_PORT: '3000'
+          # /healthz answers once Chromium has launched.
+          AWS_LWA_READINESS_CHECK_PATH: /healthz
+          AWS_LWA_INVOKE_MODE: response_stream
+          # Report init done before Lambda's 10-second init limit and keep
+          # waiting for /healthz in the first request, instead of Lambda killing
+          # a slow cold start and starting over.
+          AWS_LWA_ASYNC_INIT: 'true'
+
+  RenderUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref RenderFunction
+      # The API checks its own keys. The URL is public, but only CloudFront is
+      # documented as the way in.
+      AuthType: NONE
+      # A buffered response stops at 6 MB, which a full-page PNG often passes.
+      # A streamed one can reach 200 MB.
+      InvokeMode: RESPONSE_STREAM
+
+  # A public function URL needs both permissions.
+  RenderUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RenderFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  RenderUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RenderFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  # --- The public hostname ----------------------------------------------------
+
+  # CloudFormation adds the validation record to the hosted zone itself.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: playwright render service
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue]
+        Origins:
+          - Id: lambda
+            # https://<id>.lambda-url.us-east-1.on.aws/ -> <id>.lambda-url.us-east-1.on.aws
+            DomainName: !Select [2, !Split ['/', !GetAtt RenderUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              # The most CloudFront allows without a quota increase.
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: lambda
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # Managed-CachingDisabled: every render is new.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader: X-API-Key and every other header
+          # go through, but not Host, which the function URL must see as its own.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: false
+
+  # --- Spend limit --------------------------------------------------------------
+  # AWS cannot cap spending, so this switches the API off instead: the budget
+  # notifies the topic, and the guard sets the render function's concurrency to
+  # 0. On the 1st of the month the schedule sets it back. Budgets sees costs
+  # hours late, so the instance limit above is what bounds the overshoot.
+
+  SpendGuardTopic:
+    Type: AWS::SNS::Topic
+
+  SpendGuardTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SpendGuardTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SpendGuardTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Counts resources tagged project=playwright, which scripts/deploy.sh applies
+  # to both stacks. The tag must be activated as a cost allocation tag once, or
+  # the budget reads $0 for ever (README.md).
+  Budget:
+    Type: AWS::Budgets::Budget
+    # Budgets checks that it may publish to the topic when the budget is created.
+    DependsOn: SpendGuardTopicPolicy
+    Properties:
+      Budget:
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !If [DefaultBudget, 5, !Ref MonthlyBudgetUsd]
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - user:project$playwright
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref SpendGuardTopic
+            - !If
+              - HasAlertEmail
+              - SubscriptionType: EMAIL
+                Address: !Ref AlertEmail
+              - !Ref AWS::NoValue
+        - !If
+          - HasAlertEmail
+          - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 80
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: EMAIL
+                Address: !Ref AlertEmail
+          - !Ref AWS::NoValue
+
+  SpendGuardLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/playwright-spend-guard
+      RetentionInDays: 90
+
+  SpendGuardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: switch-render-function
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:PutFunctionConcurrency
+                Resource: !GetAtt RenderFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SpendGuardLogs.Arn
+
+  SpendGuardFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: playwright-spend-guard
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt SpendGuardRole.Arn
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref SpendGuardLogs
+      Environment:
+        Variables:
+          RENDER_FUNCTION: !Ref RenderFunction
+          MAX_INSTANCES: !If [DefaultMaxInstances, '2', !Ref MaxInstances]
+      Code:
+        ZipFile: |
+          // An SNS message means the budget was exceeded: switch the render
+          // function off. Anything else is the monthly schedule: switch it on.
+          const { LambdaClient, PutFunctionConcurrencyCommand } = require('@aws-sdk/client-lambda');
+          const lambda = new LambdaClient({});
+
+          exports.handler = async (event) => {
+            const off = Array.isArray(event.Records);
+            const limit = off ? 0 : Number(process.env.MAX_INSTANCES);
+            await lambda.send(new PutFunctionConcurrencyCommand({
+              FunctionName: process.env.RENDER_FUNCTION,
+              ReservedConcurrentExecutions: limit,
+            }));
+            console.log(off
+              ? 'Monthly budget exceeded: render function switched off until the 1st'
+              : `New budget month: render function switched on (${limit} instances)`);
+          };
+
+  SpendGuardSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SpendGuardTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SpendGuardFunction.Arn
+
+  SpendGuardTopicPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SpendGuardFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SpendGuardTopic
+
+  SpendGuardScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-spend-guard
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SpendGuardFunction.Arn
+
+  # Budget months are calendar months in UTC.
+  SpendGuardSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Switch the render function back on when a new budget month starts.
+      ScheduleExpression: cron(5 0 1 * ? *)
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt SpendGuardFunction.Arn
+        RoleArn: !GetAtt SpendGuardScheduleRole.Arn
+        Input: '{"action": "switch-on"}'
+
+Outputs:
+  PublicUrl:
+    Value: !Sub https://${DomainName}
+  DistributionDomain:
+    Description: Point DomainName at this with an alias record (README.md).
+    Value: !GetAtt Distribution.DomainName
+  FunctionUrl:
+    Description: The function's own URL. scripts/deploy.sh health-checks it.
+    Value: !GetAtt RenderUrl.FunctionUrl

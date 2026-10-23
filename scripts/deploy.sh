@@ -1,151 +1,219 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Deploys the render service to AWS Lambda, behind CloudFront.
+#
+#   bash scripts/deploy.sh              the image, the infrastructure and the
+#                                       settings in .env.production
+#   bash scripts/deploy.sh --code-only  only a new image; everything else stays
+#                                       as deployed. Push-to-deploy runs this.
+#
+# Either way it ends with the new release answering /healthz, or with the
+# previous release restored and a non-zero exit.
+
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
-if [[ ! -f .env ]]; then
-  echo "No .env in $repo_dir." >&2
-  echo "Copy .env.production.example to .env and fill in the required values." >&2
-  exit 1
-fi
+case "${1:-}" in
+  '') code_only=false ;;
+  --code-only) code_only=true ;;
+  *)
+    echo "Usage: bash scripts/deploy.sh [--code-only]" >&2
+    exit 2
+    ;;
+esac
 
-# Releases are swapped with the docker-rollout CLI plugin, which belongs to the
-# host rather than to this repository. Check before pulling, so a new server
-# fails here, naming the fix, while nothing has changed. Match the output: when
-# the plugin is missing, Docker answers `docker rollout --version` with its own
-# version and exits 0.
-if [[ "$(docker rollout --version 2>/dev/null || true)" != "docker-rollout version "* ]]; then
-  echo "The docker-rollout plugin is not installed for $(id -un) on this host." >&2
-  echo "Deploying hobby-traefik installs it, or run:" >&2
-  echo "  bash ~/projects/hobby-traefik/scripts/install-docker-rollout.sh" >&2
-  exit 1
-fi
-
-if ! docker network inspect traefik-public >/dev/null 2>&1; then
-  echo "The traefik-public network does not exist, so the shared proxy is not running." >&2
-  echo "Deploy it first: bash ~/projects/hobby-traefik/scripts/deploy.sh" >&2
-  exit 1
-fi
-
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "Refusing to deploy over tracked changes in $repo_dir" >&2
-  exit 1
-fi
-
-git pull --ff-only
-
-# What we just pulled has to survive a Windows checkout. A CR in a shell script
-# fails as `bad interpreter: ...^M` or `set: pipefail: invalid option name`,
-# neither of which names line endings; a lost mode bit fails as `Permission
-# denied`. Check here, where the previous release is still serving and nothing
-# has been rebuilt yet. `|| true` because grep and awk exit non-zero on no
-# match, which is the healthy case.
-crlf="$(git ls-files --eol -- '*.sh' | grep -E 'w/(crlf|mixed)' || true)"
-if [[ -n "$crlf" ]]; then
-  echo "CRLF line endings in tracked scripts:" >&2
-  echo "$crlf" >&2
-  echo "Commit a .gitattributes, then: git add --renormalize . && git commit" >&2
-  exit 1
-fi
-
-not_exec="$(git ls-files -s -- '*.sh' | awk '$1 != "100755" {print $4}' || true)"
-if [[ -n "$not_exec" ]]; then
-  echo "Tracked scripts are not executable:" >&2
-  echo "$not_exec" >&2
-  echo "Fix with: git update-index --chmod=+x <file>" >&2
-  exit 1
-fi
-
-compose_args=(--env-file .env -f docker-compose.yml -f docker-compose.traefik.yml -f docker-compose.prod.yml)
-compose=(docker compose "${compose_args[@]}")
-
-# Every service must be in exactly one list; see "Decide which services to roll"
-# in hobby-traefik's playbook-zero-downtime-deploys.md.
-#   before_rollout  what the rolled services need running first (databases)
-#   one_shot        jobs that run to completion before the rollout (migrations)
-#   rolled          Traefik-routed services, swapped without downtime
-#   after_rollout   everything else, updated with a plain `up`
-# The render service is the whole application, and it holds nothing between
-# requests.
-before_rollout=()
-one_shot=()
-rolled=(render)
-after_rollout=()
-long_running=("${before_rollout[@]}" "${rolled[@]}" "${after_rollout[@]}")
-
-"${compose[@]}" config --quiet
-
-# A service missing from the lists would be started once and never updated, so a
-# service added to Compose later has to be classified before the next deploy.
-listed=" ${long_running[*]} ${one_shot[*]} "
-for service in $("${compose[@]}" config --services); do
-  if [[ "$listed" != *" $service "* ]]; then
-    echo "Service '$service' is not in a service list in scripts/deploy.sh." >&2
+if [[ $code_only == false ]]; then
+  if [[ ! -f .env.production ]]; then
+    echo "No .env.production in $repo_dir." >&2
+    echo "Copy .env.production.example to .env.production and fill in the required values." >&2
     exit 1
   fi
-done
-
-# Without this every build attaches a fresh provenance attestation, which gives
-# an unchanged image a new ID, and the server's Compose (2.40) recreates any
-# container whose image ID changed: services that are not rolled restarted on
-# every deploy. These images never leave the host, so nothing reads it.
-export BUILDX_NO_DEFAULT_ATTESTATIONS=1
-"${compose[@]}" build
-
-if (( ${#before_rollout[@]} )); then
-  "${compose[@]}" up -d --wait --wait-timeout 90 "${before_rollout[@]}"
+  set -a
+  # shellcheck disable=SC1091
+  source .env.production
+  set +a
 fi
 
-# One-shot jobs finish while the previous release is still serving, so
-# migrations must stay backward compatible with it. They run through `up` rather
-# than `run` so their service container is replaced too: the rollout starts the
-# rolled services' dependencies again, and would otherwise re-run the previous
-# release's job.
-for service in "${one_shot[@]}"; do
-  "${compose[@]}" up --no-deps --exit-code-from "$service" "$service"
-done
+# CloudFront only accepts certificates from us-east-1, so the whole service
+# lives there and one stack holds it.
+export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+stack=playwright
+function_name=playwright-render # fixed in infra/app.yml
+repository=playwright           # fixed in infra/ecr.yml
+# The spend limit's budget counts whatever carries this tag.
+tags=(project=playwright)
 
-# `up` would stop the running release before starting the new one, and the site
-# would be down until the new one passed its health check. docker rollout starts
-# the new container beside the old, waits for it to turn healthy, then removes
-# the old. A release that never turns healthy is removed instead, the old one
-# keeps serving, and the deploy fails.
-#
-# The pre-stop hook drains the outgoing container first: /tmp/drain fails its
-# health check, Traefik stops routing to it, and in-flight requests finish. 20
-# seconds covers three failed probes 5 seconds apart plus Traefik noticing.
-# Renders still running after that are covered by the service's
-# stop_grace_period, not by this sleep.
-#
-# Unless the routing labels changed. Traefik refuses a service that two
-# containers describe differently and serves 404 while both exist, so draining
-# would stretch that into a 20-second outage. Stop the old one immediately
-# instead and accept a sub-second blip.
-routing_labels() { { grep -o '"traefik\.[^"]*": *"[^"]*"' || true; } | sed 's/": *"/":"/' | sort; }
-for service in "${rolled[@]}"; do
-  rollout=(docker rollout "${compose_args[@]}" --timeout 90)
-  running_ids="$("${compose[@]}" ps --quiet "$service")"
-  if [[ -n "$running_ids" ]]; then
-    live_labels="$(docker inspect --format '{{json .Config.Labels}}' "${running_ids%%$'\n'*}" | routing_labels)"
-    new_labels="$("${compose[@]}" config --format json "$service" | routing_labels)"
-    if [[ "$live_labels" == "$new_labels" ]]; then
-      rollout+=(--pre-stop-hook 'touch /tmp/drain && sleep 20')
-    else
-      echo "Routing labels of $service changed; replacing its old container without draining it."
-    fi
+# The image is tagged with the commit, so the commit has to be what is built.
+if [[ -n "$(git status --porcelain -- Dockerfile .dockerignore package.json package-lock.json src infra)" ]]; then
+  echo "Refusing to deploy: Dockerfile, the package files, src/ or infra/ have uncommitted changes." >&2
+  exit 1
+fi
+
+if ! account="$(aws sts get-caller-identity --query Account --output text)"; then
+  echo "The AWS CLI has no working credentials. Sign in first, e.g. with: aws login" >&2
+  exit 1
+fi
+
+stack_status() {
+  aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE
+}
+
+stack_output() {
+  aws cloudformation describe-stacks --stack-name "$stack" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+
+status="$(stack_status "$stack")"
+
+if [[ $code_only == true ]]; then
+  if [[ $status == NONE || $status == ROLLBACK_COMPLETE ]]; then
+    echo "Stack $stack is not deployed. Run a full deploy first: bash scripts/deploy.sh" >&2
+    exit 1
   fi
-  "${rollout[@]}" "$service"
-done
+else
+  : "${DOMAIN_NAME:?Set DOMAIN_NAME in .env.production}"
+  : "${HOSTED_ZONE_ID:?Set HOSTED_ZONE_ID in .env.production}"
+  # Route 53 prints IDs as /hostedzone/Z...; CloudFormation wants the Z... part.
+  HOSTED_ZONE_ID="${HOSTED_ZONE_ID#/hostedzone/}"
 
-# --no-deps, so a worker that depends_on a rolled service cannot recreate it.
-if (( ${#after_rollout[@]} )); then
-  "${compose[@]}" up -d --no-deps --wait --wait-timeout 90 "${after_rollout[@]}"
+  # A first deploy that failed leaves a stack that CloudFormation can only
+  # delete, and it holds no resources any more.
+  if [[ $status == ROLLBACK_COMPLETE ]]; then
+    echo "Deleting stack $stack, left behind by a first deploy that failed."
+    aws cloudformation delete-stack --stack-name "$stack"
+    aws cloudformation wait stack-delete-complete --stack-name "$stack"
+    status=NONE
+  fi
+
+  # Check here rather than let the function fail to start: the service exits on
+  # boot without keys, or with one that is too short.
+  if [[ -n "${API_KEYS:-}" ]]; then
+    IFS=, read -ra keys <<< "$API_KEYS"
+    for key in "${keys[@]}"; do
+      key="${key//[[:space:]]/}"
+      if (( ${#key} < 16 )); then
+        echo "Every key in API_KEYS must be at least 16 characters." >&2
+        exit 1
+      fi
+    done
+  elif [[ $status == NONE ]]; then
+    echo "Set API_KEYS in .env.production for the first deploy; generate a key with: openssl rand -hex 32" >&2
+    exit 1
+  fi
+
+  aws cloudformation deploy --stack-name "$stack-ecr" --template-file infra/ecr.yml \
+    --tags "${tags[@]}" --no-fail-on-empty-changeset
 fi
 
-# Removes containers of services no longer in the Compose files and confirms
-# every long-running service is healthy. Naming them with --no-deps keeps it from
-# re-running one-shot jobs or waiting on their exited containers, and
-# --no-recreate stops it replacing what was just rolled.
-"${compose[@]}" up -d --no-deps --no-recreate --remove-orphans --wait --wait-timeout 90 "${long_running[@]}"
-"${compose[@]}" ps
+registry="$account.dkr.ecr.$AWS_REGION.amazonaws.com"
+image="$registry/$repository:$(git rev-parse HEAD)"
+
+# The function runs on x86_64 (infra/app.yml). Lambda rejects the image index
+# that build attestations would wrap the image in.
+docker build --platform linux/amd64 --provenance=false --sbom=false -t "$image" .
+
+# Start the image the way Lambda will: a read-only root with only /tmp
+# writable, no /dev/shm, a user that is not in /etc/passwd and no capabilities.
+# /healthz answers only once Chromium has launched, so this catches a broken
+# browser install before anything is pushed.
+smoke="$(docker run -d --read-only --tmpfs /tmp --ipc none --user 993:990 --cap-drop ALL \
+  -e API_KEYS=smoke-test-key-0123456789 -e HOME=/tmp "$image")"
+trap 'docker rm -f "$smoke" >/dev/null 2>&1 || true' EXIT
+probe="fetch('http://127.0.0.1:3000/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+for ((i = 1; ; i++)); do
+  if docker exec "$smoke" node -e "$probe" 2>/dev/null; then
+    break
+  fi
+  if (( i == 60 )) || [[ "$(docker inspect --format '{{.State.Running}}' "$smoke")" != true ]]; then
+    echo "The image did not start; nothing was deployed. Its log:" >&2
+    docker logs "$smoke" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+docker rm -f "$smoke" >/dev/null
+echo "The image starts and launches Chromium."
+
+aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
+docker push "$image"
+
+# What to roll back to if the new release does not come up.
+previous="$(aws lambda get-function --function-name "$function_name" --query Code.ImageUri --output text 2>/dev/null || true)"
+
+# Swaps the image and nothing else: the deployed template and every other
+# parameter stay as they are. All push-to-deploy may do (infra/github-deploy.yml).
+deploy_image() {
+  local key keep=()
+  for key in $(aws cloudformation describe-stacks --stack-name "$stack" --query 'Stacks[0].Parameters[].ParameterKey' --output text); do
+    [[ $key == ImageUri ]] || keep+=("ParameterKey=$key,UsePreviousValue=true")
+  done
+  aws cloudformation update-stack --stack-name "$stack" --use-previous-template --capabilities CAPABILITY_IAM \
+    --parameters "ParameterKey=ImageUri,ParameterValue=$1" "${keep[@]}" >/dev/null
+  aws cloudformation wait stack-update-complete --stack-name "$stack"
+}
+
+if [[ $code_only == true ]]; then
+  # Command substitution drops trailing newlines on both sides.
+  if [[ "$(aws cloudformation get-template --stack-name "$stack" --query TemplateBody --output text)" != "$(cat infra/app.yml)" ]]; then
+    echo "Warning: infra/app.yml differs from the deployed template. Push-to-deploy ships code only;" >&2
+    echo "run bash scripts/deploy.sh from your machine to apply it." >&2
+  fi
+  if [[ $previous == "$image" ]]; then
+    echo "$image is already deployed."
+  else
+    deploy_image "$image"
+  fi
+else
+  params=(
+    "ImageUri=$image"
+    "DomainName=$DOMAIN_NAME"
+    "HostedZoneId=$HOSTED_ZONE_ID"
+    "MonthlyBudgetUsd=${MONTHLY_BUDGET_USD:-}"
+    "AlertEmail=${ALERT_EMAIL:-}"
+    "MaxInstances=${LAMBDA_MAX_INSTANCES:-}"
+    "MemoryMb=${LAMBDA_MEMORY_MB:-}"
+    "WebAclArn=${CLOUDFRONT_WEB_ACL_ARN:-}"
+    "JobTimeoutMs=${JOB_TIMEOUT_MS:-}"
+    "NavigationTimeoutMs=${NAVIGATION_TIMEOUT_MS:-}"
+    "MaxImageHeight=${MAX_IMAGE_HEIGHT:-}"
+    "MaxCaptureHeight=${MAX_CAPTURE_HEIGHT:-}"
+    "BrowserRecycleAfter=${BROWSER_RECYCLE_AFTER:-}"
+    "LogLevel=${LOG_LEVEL:-}"
+  )
+  # Left out, a parameter keeps its deployed value.
+  if [[ -n "${API_KEYS:-}" ]]; then
+    params+=("ApiKeys=$API_KEYS")
+  fi
+  if [[ $status == NONE ]]; then
+    echo "First deploy: the certificate and the CloudFront distribution take 5 to 15 minutes."
+  fi
+  aws cloudformation deploy --stack-name "$stack" --template-file infra/app.yml \
+    --capabilities CAPABILITY_IAM --tags "${tags[@]}" --no-fail-on-empty-changeset \
+    --parameter-overrides "${params[@]}"
+fi
+
+# Lambda routes every request to the new image once the update completes, and
+# the first one starts an instance, so this waits through a cold start.
+function_url="$(stack_output FunctionUrl)"
+healthy=false
+for ((i = 0; i < 30; i++)); do
+  if curl -fs -o /dev/null --max-time 30 "${function_url}healthz"; then
+    healthy=true
+    break
+  fi
+  sleep 2
+done
+
+if [[ $healthy == false ]]; then
+  echo "The new release does not answer ${function_url}healthz." >&2
+  if [[ -n $previous && $previous != "$image" ]]; then
+    echo "Rolling back to $previous." >&2
+    deploy_image "$previous"
+  fi
+  echo "See its log with: aws logs tail /aws/lambda/$function_name --since 15m --region $AWS_REGION" >&2
+  exit 1
+fi
+
+echo "Deployed $image"
+echo "API: $(stack_output PublicUrl)  (CloudFront: https://$(stack_output DistributionDomain))"

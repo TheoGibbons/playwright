@@ -54,8 +54,8 @@ export async function createApp(config) {
     reply.code(http.statusCode).send(http.toJSON());
   });
 
-  // The container health check probes this every 5 seconds; logging each probe
-  // would bury the render log.
+  // Docker's health check and, on Lambda, the adapter's readiness check probe
+  // this; logging each probe would bury the render log.
   app.get('/healthz', { logLevel: 'warn' }, async () => ({ ok: true, browser: browsers.status, queue: queue.stats }));
 
   app.post('/render', { schema: { body: renderBodySchema }, onRequest: authenticate }, async (request, reply) => {

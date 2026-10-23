@@ -1,9 +1,0 @@
-# Production adds HTTPS policy to the Traefik-integrated stack. Use this with
-# both docker-compose.yml and docker-compose.traefik.yml.
-
-services:
-  render:
-    labels:
-      traefik.http.routers.playwright.entrypoints: websecure
-      traefik.http.routers.playwright.tls: 'true'
-      traefik.http.routers.playwright.tls.certresolver: letsencrypt

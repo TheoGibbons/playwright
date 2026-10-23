@@ -1,42 +1,15 @@
-# Proxy-agnostic application core. Docker Compose automatically adds
-# docker-compose.override.yml for standalone use. Traefik deployments explicitly
-# combine this file with docker-compose.traefik.yml instead.
-
-name: playwright
+# Runs the image that Lambda runs on this machine, for development. LIVE is
+# deployed with scripts/deploy.sh instead; see README.md.
 
 services:
   render:
     build: .
     image: render-service
-    # No container_name: a LIVE deploy briefly runs the new release beside the old
-    # one (scripts/deploy.sh), and two containers cannot share a fixed name.
     restart: unless-stopped
-    expose:
-      - '3000'
-    environment:
-      # Fixed by the image: the host port and the public hostname are decided by
-      # the overlays, never by the application.
-      PORT: 3000
-
-      # No safe default, so a blank value fails `docker compose config` before
-      # anything is built rather than a container that exits on boot.
-      API_KEYS: ${API_KEYS:?Set API_KEYS in .env, generate a key with openssl rand -hex 32}
-
-      # Every remaining knob is passed through blank on purpose: an empty value
-      # falls back to the application's own default, so the defaults live in
-      # src/config.js alone and are never restated, and drift, here. Set any of
-      # them in .env. See "Configuration" in README.md.
-      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-}
-      MAX_QUEUE: ${MAX_QUEUE:-}
-      JOB_TIMEOUT_MS: ${JOB_TIMEOUT_MS:-}
-      NAVIGATION_TIMEOUT_MS: ${NAVIGATION_TIMEOUT_MS:-}
-      MAX_IMAGE_HEIGHT: ${MAX_IMAGE_HEIGHT:-}
-      MAX_CAPTURE_HEIGHT: ${MAX_CAPTURE_HEIGHT:-}
-      BROWSER_RECYCLE_AFTER: ${BROWSER_RECYCLE_AFTER:-}
-      IDLE_SHUTDOWN_MS: ${IDLE_SHUTDOWN_MS:-}
-      CHROMIUM_SANDBOX: ${CHROMIUM_SANDBOX:-}
-      ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-}
-      LOG_LEVEL: ${LOG_LEVEL:-}
+    env_file: .env
+    # Loopback only: nothing beyond this machine can reach it.
+    ports:
+      - '127.0.0.1:${RENDER_PORT:-3000}:3000'
     shm_size: 1gb
     mem_limit: 2g
     read_only: true
@@ -46,6 +19,4 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # On SIGTERM the server stops accepting requests and finishes the ones it
-    # has. The longest is a render at JOB_TIMEOUT_MS (60 s), plus 15 seconds.
-    stop_grace_period: 75s
+    stop_grace_period: 70s # lets in-flight renders (JOB_TIMEOUT_MS) finish

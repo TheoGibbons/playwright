@@ -1,6 +1,6 @@
 # render-service
 
-A small HTTP API that loads a URL in headless Chromium (Playwright), waits for the page's JavaScript to finish, and returns a **full-page screenshot** (PNG, JPEG or WebP, with a choice of what happens when the page is too tall), a **PDF**, the **rendered HTML** or a self-contained **MHTML** archive. It is protected by API keys and runs as a single Docker container.
+A small HTTP API that loads a URL in headless Chromium (Playwright), waits for the page's JavaScript to finish, and returns a **full-page screenshot** (PNG, JPEG or WebP, with a choice of what happens when the page is too tall), a **PDF**, the **rendered HTML** or a self-contained **MHTML** archive. It is protected by API keys and runs on AWS Lambda behind CloudFront, with a monthly spend limit that switches it off. The same Docker image runs locally.
 
 ## Using
 
@@ -9,142 +9,161 @@ KEY=<the API_KEYS>
 curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"url":"https://example.com"}' -o page.png https://playwright.sinkmailer.com/render
 ```
 
-## Deploying to LIVE
+## Deploying to AWS Lambda
 
-Needs nothing but Docker. This path publishes the API on port 80 and **TLS is your job**: put Cloudflare, nginx or Caddy in front of it. Every request carries an API key in a header, and plain HTTP puts that key on the wire in clear text.
+`scripts/deploy.sh` builds the image, checks that it starts and launches Chromium, pushes it, and deploys two CloudFormation stacks in us-east-1:
 
-```bash
-git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
-cd ~/projects/playwright
-cp .env.production.example .env
+- **`playwright-ecr`**: the image repository (`infra/ecr.yml`).
+- **`playwright`** (`infra/app.yml`): the function `playwright-render`, its function URL, a CloudFront distribution with a certificate for `DOMAIN_NAME`, and the [spend limit](#spend-limit).
 
-# Set before continuing:
-#   API_KEYS  one or more comma-separated keys of 16+ characters;
-#             generate one with: openssl rand -hex 32
-#   APP_BIND=0.0.0.0  APP_PORT=80   <- publishes publicly instead of on loopback
-nano .env
+Everything is in us-east-1 because CloudFront only accepts certificates from there. Each Lambda instance renders one page at a time, and Lambda starts more instances, up to `LAMBDA_MAX_INSTANCES`, as requests arrive. A deploy ends once the new release answers `/healthz`. If it doesn't, the script puts the previous image back and exits non-zero.
 
-docker compose up -d --build
-```
+You need Docker, and the AWS CLI signed in (`aws login`) to the account that holds the `sinkmailer.com` hosted zone.
 
-| TCP port | Allowed source | Purpose |
-|---|---|---|
-| 22 | Administrator IP | SSH and deployment |
-| 80 | Public internet | API, behind your own TLS terminator |
+### First deploy
 
-## Deploying to LIVE with hobby-traefik
-
-Requires the shared proxy. If it is not running on this instance yet:
-
-```bash
-git clone https://github.com/TheoGibbons/hobby-traefik.git ~/projects/hobby-traefik
-cd ~/projects/hobby-traefik
-bash scripts/deploy.sh
-```
-
-Point `APP_HOST`'s DNS record at this instance **before** deploying, or Let's Encrypt cannot validate it. Then:
+**1. Deploy.**
 
 ```bash
 git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
 cd ~/projects/playwright
-cp .env.production.example .env
+cp .env.production.example .env.production
 
 # Set before continuing:
-#   API_KEYS  one or more comma-separated keys of 16+ characters;
-#             generate one with: openssl rand -hex 32
-#   APP_HOST  public DNS name, already pointing at this instance
-nano .env
+#   API_KEYS        one or more comma-separated keys of 16+ characters;
+#                   generate one with: openssl rand -hex 32
+#   HOSTED_ZONE_ID  find it with:
+#                   aws route53 list-hosted-zones-by-name --dns-name sinkmailer.com \
+#                     --query "HostedZones[?Name=='sinkmailer.com.'].Id" --output text
+#   ALERT_EMAIL     optional: who is emailed at 80% and 100% of the budget
+nano .env.production
 
 bash scripts/deploy.sh
 ```
 
-On this path HTTPS comes from the production overlay and only Traefik publishes a host port. The security group needs 22, 80 and 443 open, which hobby-traefik already documents.
+The first run takes 5 to 15 minutes, most of it the certificate and the CloudFront distribution. It ends by printing the CloudFront domain.
 
-Deploys on this path do not take the API down. The script starts the new release beside the old one with the [docker-rollout](https://github.com/wowu/docker-rollout) CLI plugin, waits for it to pass its health check, lets Traefik drain the old one, then stops it. Renders still running on the old release finish first. A release that never turns healthy is discarded and the old one keeps serving. Deploying hobby-traefik installs the plugin; the script stops before pulling, with the install command, on a server that lacks it.
+**2. Try it through CloudFront** before any DNS changes. The distribution also answers on its own domain:
 
-## Deploying Locally
+```bash
+CF=$(aws cloudformation describe-stacks --region us-east-1 --stack-name playwright \
+  --query "Stacks[0].Outputs[?OutputKey=='DistributionDomain'].OutputValue" --output text)
+KEY=$(grep '^API_KEYS=' .env.production | cut -d= -f2 | cut -d, -f1)
 
-Needs only Docker. Nothing is published beyond loopback.
+curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"url":"https://example.com"}' -o page.png "https://$CF/render"
+```
+
+**3. Point the hostname at CloudFront.** `UPSERT` replaces the existing record in place, so the hostname never stops resolving. Clients follow it within the old record's TTL.
+
+```bash
+CF=$(aws cloudformation describe-stacks --region us-east-1 --stack-name playwright \
+  --query "Stacks[0].Outputs[?OutputKey=='DistributionDomain'].OutputValue" --output text)
+ZONE=$(grep '^HOSTED_ZONE_ID=' .env.production | cut -d= -f2)
+NAME=$(grep '^DOMAIN_NAME=' .env.production | cut -d= -f2)
+
+# Z2FDTNDATAQYW2 is the hosted zone of every CloudFront distribution.
+aws route53 change-resource-record-sets --hosted-zone-id "${ZONE#/hostedzone/}" --change-batch "{\"Changes\": [
+  {\"Action\": \"UPSERT\", \"ResourceRecordSet\": {\"Name\": \"$NAME\", \"Type\": \"A\",
+    \"AliasTarget\": {\"HostedZoneId\": \"Z2FDTNDATAQYW2\", \"DNSName\": \"$CF\", \"EvaluateTargetHealth\": false}}},
+  {\"Action\": \"UPSERT\", \"ResourceRecordSet\": {\"Name\": \"$NAME\", \"Type\": \"AAAA\",
+    \"AliasTarget\": {\"HostedZoneId\": \"Z2FDTNDATAQYW2\", \"DNSName\": \"$CF\", \"EvaluateTargetHealth\": false}}}
+]}"
+```
+
+These records are not part of the stack, so deploys never touch them.
+
+**4. Activate the cost allocation tag, a day later.** The budget counts only resources tagged `project=playwright`, and AWS ignores a tag until it has been activated. A new tag reaches billing data up to 24 hours after the resources carrying it are created, and until then this fails with a "tag not found" error:
+
+```bash
+aws ce update-cost-allocation-tags-status --region us-east-1 \
+  --cost-allocation-tags-status TagKey=project,Status=Active
+```
+
+Until the tag is active, the budget reads $0 and the spend limit never trips. The Billing console's **Cost allocation tags** page does the same thing.
+
+### Later deploys
+
+```bash
+bash scripts/deploy.sh
+```
+
+This deploys the checked-out commit along with whatever is in `.env.production`. It refuses uncommitted changes to anything that goes into the image or the stacks, because the image is tagged with the commit. Delete a line from `.env.production` and deploy to get the default back. A blank `API_KEYS` keeps the keys that are already deployed.
+
+### Push-to-deploy
+
+A push to `main` runs `.github/workflows/deploy.yml`, which runs `bash scripts/deploy.sh --code-only`. That deploys the new image and keeps the deployed template and settings. GitHub holds no AWS keys: the workflow signs in through GitHub's OIDC provider, as a role that can push to the image repository and point the function at a new image, and nothing else. So changes to `infra/` or `.env.production` still need `bash scripts/deploy.sh` from your machine; the workflow warns when `infra/app.yml` differs from what is deployed. The workflow is skipped until the steps below are done.
+
+**Part 1 — once per AWS account.** Skip it if another project in the account already deploys from GitHub Actions. An `EntityAlreadyExists` error means it is done.
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com
+```
+
+**Part 2 — once per repository.**
+
+```bash
+cd ~/projects/playwright
+aws cloudformation deploy --region us-east-1 --stack-name playwright-github-deploy \
+  --template-file infra/github-deploy.yml --capabilities CAPABILITY_IAM --tags project=playwright
+
+# The role only trusts jobs in this GitHub environment. Creating one that exists is harmless.
+gh api -X PUT repos/TheoGibbons/playwright/environments/production >/dev/null
+gh variable set AWS_DEPLOY_ROLE_ARN --body "$(aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name playwright-github-deploy --query "Stacks[0].Outputs[?OutputKey=='RoleArn'].OutputValue" --output text)"
+```
+
+## Spend limit
+
+AWS has no hard spending cap, so the stack switches the API off instead:
+
+1. An AWS Budget tracks this calendar month's cost of everything tagged `project=playwright`: the function, CloudFront, the image repository and the logs.
+2. When actual cost passes `MONTHLY_BUDGET_USD` (default $5), the budget notifies an SNS topic. The `playwright-spend-guard` function then sets the render function's reserved concurrency to 0. From then on every request gets 429 from Lambda, and nothing more is billed for compute.
+3. At 00:05 UTC on the 1st, a schedule sets the concurrency back to `LAMBDA_MAX_INSTANCES`.
+
+With `ALERT_EMAIL` set, the budget also emails at 80% and 100%.
+
+**How far past the limit it can go.** Budgets sees costs late: AWS refreshes billing data a few times a day, so the switch-off can land up to about a day after the limit is crossed. `LAMBDA_MAX_INSTANCES` limits how much can be spent in that time. One instance busy non-stop at 2048 MB costs about $0.12 an hour (x86, us-east-1), so the default of 2 can overshoot by a few dollars in the worst case. A flood of requests with wrong keys costs more per hour than renders do, because Lambda also bills per request; plan for about $1 an hour at worst. Set `LAMBDA_MAX_INSTANCES=1` to halve either figure.
+
+**What normal use costs.** Usually nothing beyond storage. Lambda's free tier covers 400,000 GB-seconds and 1 million requests a month, which is about 55 hours of rendering at 2048 MB. CloudFront's free tier covers 1 TB and 10 million requests. Usage inside a free tier costs $0, so it never counts toward the budget. What remains is a few cents a month: image storage (about 0.4 GB per image, three kept) and logs.
+
+**Making CloudFront unbillable.** You can also put the distribution on CloudFront's flat-rate **Free** plan: CloudFront console, the distribution, then *Pricing plan*. A distribution on a plan is never billed overages, and requests that AWS WAF blocks don't count toward its allowance. The plan attaches an AWS WAF web ACL, to which you can add rules such as rate limiting. Copy that web ACL's ARN into `CLOUDFRONT_WEB_ACL_ARN` and deploy, or the next deploy that touches the distribution detaches it.
+
+**Switching it back on early**, for example after raising `MONTHLY_BUDGET_USD`. Raising the budget doesn't switch the API back on by itself:
+
+```bash
+aws lambda put-function-concurrency --region us-east-1 --function-name playwright-render \
+  --reserved-concurrent-executions 2   # LAMBDA_MAX_INSTANCES
+```
+
+## Running locally
+
+Needs only Docker. The API is published on loopback only.
 
 ```bash
 git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
 cd ~/projects/playwright
 cp .env.example .env
+sed -i "s/^API_KEYS=$/API_KEYS=$(openssl rand -hex 32)/" .env
 
-bash scripts/up-local.sh
+docker compose up -d --build --wait
 ```
 
-The script generates an API key into the blank `API_KEYS` the first time. The API is at <http://localhost:3088>; see [To try it](#to-try-it).
-
-## Deploying Locally with hobby-traefik
-
-Start the shared proxy first if it is not already running:
-
-```bash
-git clone https://github.com/TheoGibbons/hobby-traefik.git ~/projects/hobby-traefik
-cd ~/projects/hobby-traefik
-cp .env.example .env
-bash scripts/up-local.sh
-```
-
-Then:
-
-```bash
-git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
-cd ~/projects/playwright
-cp .env.traefik.example .env
-
-bash scripts/up-local-traefik.sh
-```
-
-The script generates an API key into the blank `API_KEYS` the first time. The API is at <http://render.localhost:8085>; any `*.localhost` name resolves without DNS.
-
-## Setup push-to-deploy
-
-A push to `main` deploys to EC2 through `.github/workflows/deploy.yml`.
-
-**Part 1 — once per server, not once per project.** Skip if another project on this instance has already done it. Public repositories can skip it entirely.
-
-```bash
-# On the EC2 instance. Create a fine-grained PAT with Contents: Read-only,
-# scoped to the repositories this box deploys:
-#   https://github.com/settings/personal-access-tokens
-read -rsp 'PAT: ' PAT && echo
-
-git config --global credential.helper store
-printf 'https://x-access-token:%s@github.com\n' "$PAT" > ~/.git-credentials
-chmod 600 ~/.git-credentials
-```
-
-A deploy key cannot be shared: GitHub binds one to a single repository and rejects the same key on a second with "Key is already in use". The PAT has no such limit.
-
-**Part 2 — once per repository.** The same EC2 keypair is reused for every project, so only these four secrets are new. Create a GitHub environment named `production`, then:
-
-```bash
-# Locally, with the gh CLI authenticated:
-gh secret set EC2_HOST            --env production --body '<ec2-public-dns>'
-gh secret set EC2_USER            --env production --body 'ubuntu'
-gh secret set EC2_SSH_PRIVATE_KEY --env production < ~/.ssh/<ec2-deploy-key>
-gh secret set EC2_KNOWN_HOSTS     --env production \
-  --body "$(ssh-keyscan -H <ec2-public-dns> 2>/dev/null)"
-```
-
-The deploy stops rather than overwrite tracked files edited directly on the server, and stops if the pulled checkout has CRLF line endings or a script that lost its executable bit. Commit through Git instead of letting the live and local copies drift.
-
-A push deploys with the `scripts/deploy.sh` already on the server, which then pulls. A change to the script itself therefore takes effect from the deploy after the one that ships it.
+The API is at <http://localhost:3000>; see [To try it](#to-try-it). This runs the same image as Lambda, but as a long-running server: it uses the local-only settings in [Configuration](#configuration), and nothing in front of it.
 
 ## To try it
 
-With the service running locally (see [Deploying Locally](#deploying-locally)):
+With the service running locally (see [Running locally](#running-locally)):
 
 ```bash
 KEY=$(grep '^API_KEYS=' .env | cut -d= -f2 | cut -d, -f1)
 
 curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"url":"https://example.com"}' -o page.png localhost:3088/render
+  -d '{"url":"https://example.com"}' -o page.png localhost:3000/render
 ```
 
-Through the local proxy, use `render.localhost:8085/render` instead. For a PDF send `'{"url":"...","format":"pdf"}'`, or use `"format":"html"` for the rendered HTML.
+For a PDF send `'{"url":"...","format":"pdf"}'`, or use `"format":"html"` for the rendered HTML.
 
 ## API
 
@@ -207,7 +226,7 @@ Unauthenticated. Reports browser and queue state. `browser.running` is `false` w
 
 ### Errors
 
-Errors are JSON: `{"error": "<code>", "message": "..."}`.
+Errors from the service are JSON: `{"error": "<code>", "message": "..."}`.
 
 | Status | `error` | When |
 |---|---|---|
@@ -216,8 +235,10 @@ Errors are JSON: `{"error": "<code>", "message": "..."}`.
 | 403 | `blocked_address` | The URL, or a redirect, points at a private or internal address |
 | 422 | `page_too_tall` | `overflow: "error"` and the page exceeds `maxHeight` (includes `pageHeight`, `maxHeight`) |
 | 502 | `navigation_failed`, `dns_failed` | The site couldn't be loaded |
-| 503 | `queue_full` | Too many requests waiting; has `Retry-After` |
+| 503 | `queue_full` | Locally only: too many requests waiting; has `Retry-After` |
 | 504 | `navigation_timeout`, `wait_timeout`, `job_timeout` | Something took too long |
+
+On Lambda, two more come from AWS and aren't JSON in this shape: **429** when more than `LAMBDA_MAX_INSTANCES` requests are in progress at once or the [spend limit](#spend-limit) has switched the API off, and **504** from CloudFront when nothing came back within 60 seconds.
 
 ## Waiting
 
@@ -250,53 +271,90 @@ No mode captures more than `MAX_CAPTURE_HEIGHT` (100,000 CSS px), which stops in
 
 ## Idle memory
 
-Chromium is started at boot, so a broken install fails immediately rather than on the first request. After `IDLE_SHUTDOWN_MS` without renders it is closed, and the next request launches it again. Concurrent requests share that one launch. This suits occasional use: the idle container drops to roughly the Node process alone, and the first render after an idle period pays the browser's start-up time. Set `IDLE_SHUTDOWN_MS=0` if you'd rather trade memory for that latency.
+Chromium is started at boot, so a broken install fails immediately rather than on the first request.
+
+**Locally**, it is closed after `IDLE_SHUTDOWN_MS` without renders, and the next request launches it again. Concurrent requests share that one launch. The idle container drops to roughly the Node process alone, and the first render after an idle period pays the browser's start-up time. Set `IDLE_SHUTDOWN_MS=0` if you'd rather trade memory for that latency.
+
+**On Lambda**, Chromium stays up for the life of an instance. Lambda freezes an instance between requests and bills nothing while it is frozen, so closing the browser would save nothing. The cost moves to cold starts instead: the first request to a new instance waits a few seconds for Chromium to launch. That happens after a deploy, when traffic needs another instance, and when Lambda retires an instance that has been idle.
 
 ## Security
 
-- **SSRF.** All of Chromium's traffic goes through a small proxy inside the service. The proxy resolves each hostname itself, refuses anything that isn't a public unicast address (localhost, RFC 1918, link-local / cloud metadata, CGNAT, IPv6 ULA, ...), and then connects to exactly the address it checked. This covers redirects, subresources, iframes, fetch, WebSockets and DNS-rebinding tricks; `page.route` checks miss several of these. WebRTC UDP and QUIC are disabled so nothing bypasses the proxy. That also keeps pages away from the other containers on `traefik-public`. Set `ALLOW_PRIVATE_NETWORKS=true` only if you need to render intranet pages and trust every key holder.
-- **Defence in depth.** For a second layer, block the container's outbound traffic to private ranges at the host firewall (Docker's `DOCKER-USER` iptables chain). Make sure you don't also block the Docker networks the container sits on, or Traefik (or your own TLS terminator) won't be able to reach the API.
-- **Keys** are compared in constant time. Use long random ones, and HTTPS whenever the service is reachable over a network: the hobby-traefik path provides it, and standalone LIVE needs a terminator in front.
+- **SSRF.** All of Chromium's traffic goes through a small proxy inside the service. The proxy resolves each hostname itself, refuses anything that isn't a public unicast address (localhost, RFC 1918, link-local / cloud metadata, CGNAT, IPv6 ULA, ...), and then connects to exactly the address it checked. This covers redirects, subresources, iframes, fetch, WebSockets and DNS-rebinding tricks; `page.route` checks miss several of these. WebRTC UDP and QUIC are disabled so nothing bypasses the proxy. On Lambda it also keeps pages away from the Lambda Runtime API on `127.0.0.1:9001`, through which a page could otherwise read or answer other requests. That is why the Lambda stack never passes `ALLOW_PRIVATE_NETWORKS`. Set it locally only, to render intranet pages, and only if you trust every key holder.
+- **AWS permissions.** The render function's role can write its own logs and nothing else, so even a page that escaped Chromium would find no AWS access worth having. The push-to-deploy role can only ship images.
+- **Keys** are compared in constant time. Use long random ones. CloudFront serves HTTPS only (TLS 1.2+). The function's own `lambda-url` address is public too: limiting a function URL to CloudFront would make every caller sign request bodies. The keys protect both addresses equally.
 - **`headers`** are only attached to requests for the target URL's origin, so an `Authorization` header doesn't leak to third-party scripts or CDNs. Cookies follow normal browser scoping.
-- **Container.** It runs as a non-root user with a read-only filesystem, all capabilities dropped and `no-new-privileges`. Chromium's own sandbox is off by default (Playwright's default in Docker, because it needs user namespaces). If your host allows it, set `CHROMIUM_SANDBOX=true` and run with [Playwright's seccomp profile](https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json).
+- **Isolation.** On Lambda every instance is its own microVM with a read-only filesystem apart from `/tmp`, running as an unprivileged user. Locally the container runs as a non-root user with a read-only filesystem, all capabilities dropped and `no-new-privileges`. Chromium's own sandbox is off by default (Playwright's default in Docker, because it needs user namespaces), and Lambda can't run it at all. Locally, if your host allows it, set `CHROMIUM_SANDBOX=true` and run with [Playwright's seccomp profile](https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json).
 
 ## Configuration
 
-Set these in `.env`. Blank or absent means the default.
+Blank or absent means the default. Locally, set these in `.env`. For Lambda, set them in `.env.production` and run `bash scripts/deploy.sh`.
+
+**Both:**
 
 | Variable | Default | |
 |---|---|---|
-| `API_KEYS` | (required) | Comma-separated, each at least 16 characters. Compose refuses to start without it |
-| `APP_BIND` | `127.0.0.1` | Host address the API is published on, standalone only. `0.0.0.0` for standalone LIVE |
-| `APP_PORT` | `3088` | Host port, standalone only. `80` for standalone LIVE |
-| `APP_HOST` | (required with Traefik) | Hostname Traefik routes to the API, e.g. `render.localhost` locally |
-| `MAX_CONCURRENCY` | `2` | Renders in parallel. Chromium idles at about 400 MB; each heavy page can add several hundred MB more. |
-| `MAX_QUEUE` | `20` | Requests that may wait for a slot before getting 503 |
-| `JOB_TIMEOUT_MS` | `60000` | Hard limit per render (excluding queue time). Raising it means raising `stop_grace_period` in `docker-compose.yml` too, or a deploy cuts off the longest renders |
+| `API_KEYS` | (required) | Comma-separated, each at least 16 characters |
+| `JOB_TIMEOUT_MS` | `60000`, `50000` on Lambda | Hard limit per render (excluding queue time). On Lambda the answer has to beat CloudFront's 60-second origin timeout, cold start included. Going higher needs a CloudFront quota increase, and `OriginReadTimeout` and `Timeout` raised in `infra/app.yml` |
 | `NAVIGATION_TIMEOUT_MS` | `30000` | Limit for the initial page load |
 | `MAX_IMAGE_HEIGHT` | `32768` | Upper bound for `maxHeight` |
 | `MAX_CAPTURE_HEIGHT` | `100000` | Most CSS pixels of a page ever captured |
 | `BROWSER_RECYCLE_AFTER` | `200` | Restart Chromium after this many renders |
-| `IDLE_SHUTDOWN_MS` | `60000` | Close Chromium after this long without renders; the next request starts it again (see [Idle memory](#idle-memory)). `0` keeps it running. |
+| `LOG_LEVEL` | `info` | |
+
+**Lambda only** (`.env.production`):
+
+| Variable | Default | |
+|---|---|---|
+| `DOMAIN_NAME` | `playwright.sinkmailer.com` | Public hostname. CloudFront serves it with a certificate validated through `HOSTED_ZONE_ID` |
+| `HOSTED_ZONE_ID` | (required) | Route 53 hosted zone that holds `DOMAIN_NAME` |
+| `MONTHLY_BUDGET_USD` | `5` | Monthly cost at which the API is switched off; see [Spend limit](#spend-limit) |
+| `ALERT_EMAIL` | | Emailed at 80% and 100% of the budget |
+| `LAMBDA_MAX_INSTANCES` | `2` | Instances that may run at once, each rendering one page; more simultaneous requests get 429. Also limits how fast money can be spent |
+| `LAMBDA_MEMORY_MB` | `2048` | Memory per instance; Lambda allocates CPU in proportion, a full vCPU at 1769 MB. Chromium idles at about 400 MB, and a heavy page can add several hundred more |
+| `CLOUDFRONT_WEB_ACL_ARN` | | Only with a CloudFront flat-rate plan; see [Spend limit](#spend-limit) |
+
+**Local only** (`.env`):
+
+| Variable | Default | |
+|---|---|---|
+| `RENDER_PORT` | `3000` | Host port, on 127.0.0.1 |
+| `MAX_CONCURRENCY` | `2` | Renders in parallel. Chromium idles at about 400 MB; each heavy page can add several hundred MB more |
+| `MAX_QUEUE` | `20` | Requests that may wait for a slot before getting 503 |
+| `IDLE_SHUTDOWN_MS` | `60000` | Close Chromium after this long without renders; see [Idle memory](#idle-memory). `0` keeps it running. Always `0` on Lambda |
 | `CHROMIUM_SANDBOX` | `false` | See Security |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | See Security |
-| `LOG_LEVEL` | `info` | |
-| `PORT` | `3000` | Port inside the container. Fixed at 3000 by `docker-compose.yml`; only matters when running outside Docker |
+| `PORT` | `3000` | Port inside the container. Only matters when running outside Docker |
 
 ## Operating it
 
 ```bash
-docker compose logs -f render                 # standalone
-docker compose ps
+aws logs tail /aws/lambda/playwright-render --follow --region us-east-1         # renders
+aws logs tail /aws/lambda/playwright-spend-guard --since 31d --region us-east-1  # spend limit switching
+aws lambda get-function-concurrency --function-name playwright-render --region us-east-1
+                                       # 0 means the spend limit has switched it off
 ```
 
-Add `-f docker-compose.yml -f docker-compose.traefik.yml` (plus `-f docker-compose.prod.yml` on the server) to operate a Traefik-integrated stack. The scripts pass those explicitly so Compose never merges the standalone override in by accident. Container names change on every LIVE deploy (`playwright-render-1`, then `-2`, ...), so always go through `docker compose ... logs render` rather than a container name.
+To try the spend limit, switch the API off and back on as the budget and the monthly schedule would:
 
-Nothing is stored: there are no volumes and nothing to back up.
+```bash
+aws lambda invoke --region us-east-1 --function-name playwright-spend-guard \
+  --cli-binary-format raw-in-base64-out --payload '{"Records": []}' /dev/null   # off
+aws lambda invoke --region us-east-1 --function-name playwright-spend-guard \
+  --cli-binary-format raw-in-base64-out --payload '{}' /dev/null                # on
+```
 
-During a LIVE deploy the old and new releases run side by side for up to half a minute, plus however long the old one's in-flight renders take. Leave memory for two containers, each capped at 2 GB by `mem_limit`.
+To roll back, check out the earlier commit and run `bash scripts/deploy.sh`, or revert the commit and push.
 
-`GET /healthz` is the health check the container and deploys rely on. It does not launch Chromium, so it does not stop an idle browser from shutting down.
+Nothing is stored: there are no volumes or databases and nothing to back up. To remove the service, first point `DOMAIN_NAME` elsewhere or delete its A and AAAA records, then:
+
+```bash
+aws cloudformation delete-stack --region us-east-1 --stack-name playwright
+aws cloudformation wait stack-delete-complete --region us-east-1 --stack-name playwright
+aws cloudformation delete-stack --region us-east-1 --stack-name playwright-ecr
+aws cloudformation delete-stack --region us-east-1 --stack-name playwright-github-deploy  # if created
+```
+
+Locally, `docker compose logs -f render` and `docker compose ps`. `GET /healthz` is what the container's health check, Lambda's readiness check and `scripts/deploy.sh` rely on. It does not launch Chromium, so it does not stop an idle browser from shutting down.
 
 ## Development
 
@@ -307,7 +365,7 @@ API_KEYS=dev-key-0123456789abcdef ALLOW_PRIVATE_NETWORKS=true npm run dev
 npm test
 ```
 
-The tests start a local fixture site and drive the real browser end to end: waiting strategies, tile stitching across seams, every overflow mode, every format, auth, timeouts, queue limits, and the SSRF guard (including a control test that proves the same page *does* reach localhost when private networks are allowed). To run them inside the production image:
+The tests start a local fixture site and drive the real browser end to end: waiting strategies, tile stitching across seams, every overflow mode, every format, auth, timeouts, queue limits, and the SSRF guard (including a control test that proves the same page *does* reach localhost when private networks are allowed). To run them inside the image that Lambda runs:
 
 ```bash
 docker build -t render-service .
@@ -319,5 +377,6 @@ docker run --rm --read-only --tmpfs /tmp --shm-size 1g -v "$PWD/test:/app/test:r
 
 - **Inner scroll containers.** Apps that scroll an inner element instead of the page (`body { height: 100vh; overflow: hidden }`) only produce a viewport-sized "full page", and the same goes for PDF. A taller `viewport.height` (up to 4320) is the practical workaround.
 - **Width.** Full-page screenshots are the viewport's width; content that overflows sideways is cut off.
-- **Bot protection.** Some sites (Cloudflare challenges and similar) block automated browsers. You'll get the challenge page, usually with a 403 in `X-Upstream-Status`. The service removes the two plainest signs: the user agent says `Chrome` rather than `HeadlessChrome`, and `navigator.webdriver` is `false`. Other signs remain, and running Chromium with a window (under Xvfb) would not remove them: the server's datacenter IP address, WebGL rendered in software (SwiftShader), and traces of the automation protocol. If you set `userAgent` yourself, match the real browser. Use Chrome's shortened form (`Chrome/<major>.0.0.0`) with the same major version, because pages also receive `Sec-CH-UA` client hints that name the real version.
+- **Lambda limits.** A response can be up to 200 MB, Lambda's limit for streamed responses. Lambda sends the first 6 MB at full speed and throttles the rest, so very large images take noticeably longer to arrive. Simultaneous requests beyond `LAMBDA_MAX_INSTANCES` get 429 instead of queueing, so retry them after a moment.
+- **Bot protection.** Some sites (Cloudflare challenges and similar) block automated browsers. You'll get the challenge page, usually with a 403 in `X-Upstream-Status`. The service removes the two plainest signs: the user agent says `Chrome` rather than `HeadlessChrome`, and `navigator.webdriver` is `false`. Other signs remain, and running Chromium with a window (under Xvfb) would not remove them: the datacenter IP address (AWS's, on Lambda), WebGL rendered in software (SwiftShader), and traces of the automation protocol. If you set `userAgent` yourself, match the real browser. Use Chrome's shortened form (`Chrome/<major>.0.0.0`) with the same major version, because pages also receive `Sec-CH-UA` client hints that name the real version.
 - **Fonts.** The image covers Latin, CJK, Thai, emoji and most Noto scripts. Add packages to the Dockerfile if you need others.
