@@ -21,6 +21,7 @@ export async function createApp(config) {
     proxyUrl: proxy.url,
     sandbox: config.chromiumSandbox,
     recycleAfter: config.recycleAfter,
+    idleShutdownMs: config.idleShutdownMs,
     log: app.log.child({ component: 'browser' }),
   });
   await browsers.start();

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { unzipSync } from 'fflate';
 import sharp from 'sharp';
 import { createApp } from '../src/app.js';
@@ -79,7 +80,7 @@ describe('render API', () => {
     test('health check needs no key', async () => {
       const res = await fetch(`${svc.base}/healthz`);
       assert.equal(res.status, 200);
-      assert.equal((await res.json()).browser.connected, true);
+      assert.equal((await res.json()).browser.running, true);
     });
   });
 
@@ -295,6 +296,42 @@ describe('limits', () => {
 
   test('the service still works after a timeout killed a context', async () => {
     const res = await svc.post({ url: fixtures.url('/hidden'), format: 'html', wait: { until: 'load' } });
+    assert.equal(res.status, 200);
+  });
+});
+
+describe('idle shutdown', () => {
+  let svc;
+  const browserStatus = async () => (await (await fetch(`${svc.base}/healthz`)).json()).browser;
+  const quickRender = () => svc.post({ url: fixtures.url('/hidden'), format: 'html', wait: { until: 'load' } });
+
+  before(async () => {
+    svc = await startApp({ idleShutdownMs: 300 });
+  });
+  after(async () => {
+    await svc.app.close();
+  });
+
+  test('closes Chromium when idle and relaunches it on the next request', async () => {
+    await sleep(600);
+    assert.equal((await browserStatus()).running, false);
+
+    assert.equal((await quickRender()).status, 200);
+    assert.equal((await browserStatus()).running, true);
+
+    await sleep(600);
+    assert.equal((await browserStatus()).running, false);
+  });
+
+  test('concurrent requests after an idle stop share one relaunch', async () => {
+    await sleep(600);
+    const statuses = await Promise.all([quickRender(), quickRender(), quickRender()]).then((rs) => rs.map((r) => r.status));
+    assert.deepEqual(statuses, [200, 200, 200]);
+    assert.equal((await browserStatus()).served, 3, 'all three renders ran on the same freshly launched browser');
+  });
+
+  test('a render longer than the idle timeout is not interrupted', async () => {
+    const res = await svc.post({ url: fixtures.url('/late'), format: 'html', wait: { until: 'load', delayMs: 1000 } });
     assert.equal(res.status, 200);
   });
 });

@@ -8,17 +8,28 @@ A small HTTP API that loads a URL in headless Chromium (Playwright), waits for t
 
 It is protected by API keys and runs as a single Docker container.
 
+## To try it
+
+With the service running (see [Quick start](#quick-start)):
+
+```bash
+KEY=$(grep API_KEYS .env | cut -d= -f2)
+
+curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"url":"https://example.com"}' -o page.png localhost:3000/render
+```
+
+Use whatever port you set as `RENDER_PORT` in `.env` (default 3000). For a PDF send `'{"url":"...","format":"pdf"}'`, or use `"format":"html"` for the rendered HTML.
+
 ## Quick start
 
 ```bash
 cp .env.example .env
 # put a key in API_KEYS, e.g. the output of: openssl rand -hex 32
 docker compose up -d --build
-
-curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"url":"https://example.com"}' \
-  -o page.png http://localhost:3000/render
 ```
+
+Then run the command under [To try it](#to-try-it).
 
 To serve it over HTTPS, point a domain at the server, set `DOMAIN` in `.env` and run `docker compose --profile tls up -d`. Caddy gets the certificate automatically. When you do, bind the API port to localhost (`"127.0.0.1:3000:3000"`) so it is only reachable through Caddy.
 
@@ -79,7 +90,7 @@ The response body is the file itself. Response headers describe what happened:
 
 ### `GET /healthz`
 
-Unauthenticated. Reports browser and queue state.
+Unauthenticated. Reports browser and queue state. `browser.running` is `false` while Chromium is stopped for being idle; that's normal, and the endpoint still returns 200.
 
 ### Errors
 
@@ -124,6 +135,10 @@ For very long documents, `format: "pdf"` is often a better fit, because it pagin
 
 No mode captures more than `MAX_CAPTURE_HEIGHT` (100,000 CSS px), which stops infinite-scroll pages from growing forever.
 
+## Idle memory
+
+Chromium is started at boot, so a broken install fails immediately rather than on the first request. After `IDLE_SHUTDOWN_MS` without renders it is closed, and the next request launches it again. Concurrent requests share that one launch. This suits occasional use: the idle container drops to roughly the Node process alone, and the first render after an idle period pays the browser's start-up time. Set `IDLE_SHUTDOWN_MS=0` if you'd rather trade memory for that latency.
+
 ## Security
 
 - **SSRF.** All of Chromium's traffic goes through a small proxy inside the service. The proxy resolves each hostname itself, refuses anything that isn't a public unicast address (localhost, RFC 1918, link-local / cloud metadata, CGNAT, IPv6 ULA, ...), and then connects to exactly the address it checked. This covers redirects, subresources, iframes, fetch, WebSockets and DNS-rebinding tricks; `page.route` checks miss several of these. WebRTC UDP and QUIC are disabled so nothing bypasses the proxy. Set `ALLOW_PRIVATE_NETWORKS=true` only if you need to render intranet pages and trust every key holder.
@@ -146,6 +161,7 @@ No mode captures more than `MAX_CAPTURE_HEIGHT` (100,000 CSS px), which stops in
 | `MAX_IMAGE_HEIGHT` | `32768` | Upper bound for `maxHeight` |
 | `MAX_CAPTURE_HEIGHT` | `100000` | Most CSS pixels of a page ever captured |
 | `BROWSER_RECYCLE_AFTER` | `200` | Restart Chromium after this many renders |
+| `IDLE_SHUTDOWN_MS` | `60000` | Close Chromium after this long without renders; the next request starts it again (see below). `0` keeps it running. |
 | `CHROMIUM_SANDBOX` | `false` | See Security |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | See Security |
 | `LOG_LEVEL` | `info` | |

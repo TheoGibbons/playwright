@@ -43,6 +43,9 @@ export const config = {
 
   // Relaunch Chromium after this many renders to shed leaked memory.
   recycleAfter: int('BROWSER_RECYCLE_AFTER', 200),
+  // Close Chromium after this long without renders, freeing its memory; the
+  // next request starts it again. 0 keeps it running.
+  idleShutdownMs: int('IDLE_SHUTDOWN_MS', 60_000),
   chromiumSandbox: bool('CHROMIUM_SANDBOX', false),
 
   // Lets pages reach localhost / RFC1918 / link-local addresses. Leave off on
