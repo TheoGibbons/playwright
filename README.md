@@ -2,6 +2,13 @@
 
 A small HTTP API that loads a URL in headless Chromium (Playwright), waits for the page's JavaScript to finish, and returns a **full-page screenshot** (PNG, JPEG or WebP, with a choice of what happens when the page is too tall), a **PDF**, the **rendered HTML** or a self-contained **MHTML** archive. It is protected by API keys and runs as a single Docker container.
 
+## Using
+
+```bash
+KEY=<the API_KEYS>
+curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"url":"https://example.com"}' -o page.png https://playwright.sinkmailer.com/render
+```
+
 ## Deploying to LIVE
 
 Needs nothing but Docker. This path publishes the API on port 80 and **TLS is your job**: put Cloudflare, nginx or Caddy in front of it. Every request carries an API key in a header, and plain HTTP puts that key on the wire in clear text.
