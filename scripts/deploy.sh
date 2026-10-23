@@ -113,12 +113,13 @@ image="$registry/$repository:$(git rev-parse HEAD)"
 # that build attestations would wrap the image in.
 docker build --platform linux/amd64 --provenance=false --sbom=false -t "$image" .
 
-# Start the image the way Lambda will: a read-only root with only /tmp
-# writable, no /dev/shm, a user that is not in /etc/passwd and no capabilities.
-# /healthz answers only once Chromium has launched, so this catches a broken
-# browser install before anything is pushed.
+# Start the image the way Lambda will: its entrypoint (ImageConfig in
+# infra/app.yml), a read-only root with only /tmp writable, no /dev/shm, a user
+# that is not in /etc/passwd and no capabilities. /healthz answers only once
+# Chromium has launched, so this catches a broken browser install before
+# anything is pushed.
 smoke="$(docker run -d --read-only --tmpfs /tmp --ipc none --user 993:990 --cap-drop ALL \
-  -e API_KEYS=smoke-test-key-0123456789 -e HOME=/tmp "$image")"
+  -e API_KEYS=smoke-test-key-0123456789 -e HOME=/tmp --entrypoint node "$image" src/server.js)"
 trap 'docker rm -f "$smoke" >/dev/null 2>&1 || true' EXIT
 probe="fetch('http://127.0.0.1:3000/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 for ((i = 1; ; i++)); do

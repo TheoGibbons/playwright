@@ -42,7 +42,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD node -e "fetch('http://127.0.0.1:3000/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 
-# -s: on Lambda tini is not PID 1, and has to register as a subreaper to be
-# handed the orphans.
-ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
+# Lambda skips tini and runs node itself (ImageConfig in infra/app.yml): its
+# own init is PID 1 there, and it forbids tini to register as a subreaper.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "src/server.js"]
