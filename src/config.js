@@ -22,7 +22,7 @@ const apiKeys = (process.env.API_KEYS ?? '')
 export const config = {
   host: process.env.HOST ?? '0.0.0.0',
   port: int('PORT', 3000),
-  logLevel: process.env.LOG_LEVEL ?? 'info',
+  logLevel: process.env.LOG_LEVEL || 'info',
 
   apiKeys,
 

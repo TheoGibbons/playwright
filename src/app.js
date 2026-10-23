@@ -34,6 +34,19 @@ export async function createApp(config) {
     await proxy.close();
   });
 
+  // close() waits for every connection to end, but only closes the ones idle
+  // when it starts. A keep-alive connection from a reverse proxy that was busy
+  // with a render would then idle for keepAliveTimeout (72 s) before ending, and
+  // `docker stop` would kill the process first. So once shutdown begins, each
+  // response closes its connection.
+  let closing = false;
+  app.addHook('preClose', async () => {
+    closing = true;
+  });
+  app.addHook('onSend', async (request, reply) => {
+    if (closing) reply.header('connection', 'close');
+  });
+
   app.setErrorHandler((err, request, reply) => {
     const http = toHttpError(err);
     if (http.statusCode >= 500 && http.code !== 'job_timeout') request.log.error({ err }, 'render failed');
@@ -41,7 +54,9 @@ export async function createApp(config) {
     reply.code(http.statusCode).send(http.toJSON());
   });
 
-  app.get('/healthz', async () => ({ ok: true, browser: browsers.status, queue: queue.stats }));
+  // The container health check probes this every 5 seconds; logging each probe
+  // would bury the render log.
+  app.get('/healthz', { logLevel: 'warn' }, async () => ({ ok: true, browser: browsers.status, queue: queue.stats }));
 
   app.post('/render', { schema: { body: renderBodySchema }, onRequest: authenticate }, async (request, reply) => {
     const opts = normalizeOptions(request.body, config);

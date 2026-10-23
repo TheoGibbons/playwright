@@ -87,6 +87,11 @@ export class BrowserManager {
       // separate headless shell differs in small ways).
       channel: 'chromium',
       chromiumSandbox: this.sandbox,
+      // Playwright would otherwise kill Chromium the instant a signal arrives,
+      // failing every render in flight. server.js owns shutdown: it lets those
+      // renders finish, then closes the browser.
+      handleSIGTERM: false,
+      handleSIGINT: false,
       proxy: { server: this.proxyUrl },
       args: [
         // Keep every byte on the proxied path.

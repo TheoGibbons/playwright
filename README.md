@@ -1,37 +1,143 @@
 # render-service
 
-A small HTTP API that loads a URL in headless Chromium (Playwright), waits for the page's JavaScript to finish, and returns one of:
+A small HTTP API that loads a URL in headless Chromium (Playwright), waits for the page's JavaScript to finish, and returns a **full-page screenshot** (PNG, JPEG or WebP, with a choice of what happens when the page is too tall), a **PDF**, the **rendered HTML** or a self-contained **MHTML** archive. It is protected by API keys and runs as a single Docker container.
 
-- a **full-page screenshot** (PNG / JPEG / WebP), with a choice of what happens when the page is too tall
-- a **PDF**
-- the **rendered HTML**, or a self-contained **MHTML** archive
+## Deploying to LIVE
 
-It is protected by API keys and runs as a single Docker container.
-
-## To try it
-
-With the service running (see [Quick start](#quick-start)):
+Needs nothing but Docker. This path publishes the API on port 80 and **TLS is your job**: put Cloudflare, nginx or Caddy in front of it. Every request carries an API key in a header, and plain HTTP puts that key on the wire in clear text.
 
 ```bash
-KEY=$(grep API_KEYS .env | cut -d= -f2)
+git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
+cd ~/projects/playwright
+cp .env.production.example .env
 
-curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"url":"https://example.com"}' -o page.png localhost:3000/render
-```
+# Set before continuing:
+#   API_KEYS  one or more comma-separated keys of 16+ characters;
+#             generate one with: openssl rand -hex 32
+#   APP_BIND=0.0.0.0  APP_PORT=80   <- publishes publicly instead of on loopback
+nano .env
 
-Use whatever port you set as `RENDER_PORT` in `.env` (default 3000). For a PDF send `'{"url":"...","format":"pdf"}'`, or use `"format":"html"` for the rendered HTML.
-
-## Quick start
-
-```bash
-cp .env.example .env
-# put a key in API_KEYS, e.g. the output of: openssl rand -hex 32
 docker compose up -d --build
 ```
 
-Then run the command under [To try it](#to-try-it).
+| TCP port | Allowed source | Purpose |
+|---|---|---|
+| 22 | Administrator IP | SSH and deployment |
+| 80 | Public internet | API, behind your own TLS terminator |
 
-To serve it over HTTPS, point a domain at the server, set `DOMAIN` in `.env` and run `docker compose --profile tls up -d`. Caddy gets the certificate automatically. When you do, bind the API port to localhost (`"127.0.0.1:3000:3000"`) so it is only reachable through Caddy.
+## Deploying to LIVE with hobby-traefik
+
+Requires the shared proxy. If it is not running on this instance yet:
+
+```bash
+git clone https://github.com/TheoGibbons/hobby-traefik.git ~/projects/hobby-traefik
+cd ~/projects/hobby-traefik
+bash scripts/deploy.sh
+```
+
+Point `APP_HOST`'s DNS record at this instance **before** deploying, or Let's Encrypt cannot validate it. Then:
+
+```bash
+git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
+cd ~/projects/playwright
+cp .env.production.example .env
+
+# Set before continuing:
+#   API_KEYS  one or more comma-separated keys of 16+ characters;
+#             generate one with: openssl rand -hex 32
+#   APP_HOST  public DNS name, already pointing at this instance
+nano .env
+
+bash scripts/deploy.sh
+```
+
+On this path HTTPS comes from the production overlay and only Traefik publishes a host port. The security group needs 22, 80 and 443 open, which hobby-traefik already documents.
+
+Deploys on this path do not take the API down. The script starts the new release beside the old one with the [docker-rollout](https://github.com/wowu/docker-rollout) CLI plugin, waits for it to pass its health check, lets Traefik drain the old one, then stops it. Renders still running on the old release finish first. A release that never turns healthy is discarded and the old one keeps serving. Deploying hobby-traefik installs the plugin; the script stops before pulling, with the install command, on a server that lacks it.
+
+## Deploying Locally
+
+Needs only Docker. Nothing is published beyond loopback.
+
+```bash
+git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
+cd ~/projects/playwright
+cp .env.example .env
+
+bash scripts/up-local.sh
+```
+
+The script generates an API key into the blank `API_KEYS` the first time. The API is at <http://localhost:3088>; see [To try it](#to-try-it).
+
+## Deploying Locally with hobby-traefik
+
+Start the shared proxy first if it is not already running:
+
+```bash
+git clone https://github.com/TheoGibbons/hobby-traefik.git ~/projects/hobby-traefik
+cd ~/projects/hobby-traefik
+cp .env.example .env
+bash scripts/up-local.sh
+```
+
+Then:
+
+```bash
+git clone https://github.com/TheoGibbons/playwright.git ~/projects/playwright
+cd ~/projects/playwright
+cp .env.traefik.example .env
+
+bash scripts/up-local-traefik.sh
+```
+
+The script generates an API key into the blank `API_KEYS` the first time. The API is at <http://render.localhost:8085>; any `*.localhost` name resolves without DNS.
+
+## Setup push-to-deploy
+
+A push to `main` deploys to EC2 through `.github/workflows/deploy.yml`.
+
+**Part 1 — once per server, not once per project.** Skip if another project on this instance has already done it. Public repositories can skip it entirely.
+
+```bash
+# On the EC2 instance. Create a fine-grained PAT with Contents: Read-only,
+# scoped to the repositories this box deploys:
+#   https://github.com/settings/personal-access-tokens
+read -rsp 'PAT: ' PAT && echo
+
+git config --global credential.helper store
+printf 'https://x-access-token:%s@github.com\n' "$PAT" > ~/.git-credentials
+chmod 600 ~/.git-credentials
+```
+
+A deploy key cannot be shared: GitHub binds one to a single repository and rejects the same key on a second with "Key is already in use". The PAT has no such limit.
+
+**Part 2 — once per repository.** The same EC2 keypair is reused for every project, so only these four secrets are new. Create a GitHub environment named `production`, then:
+
+```bash
+# Locally, with the gh CLI authenticated:
+gh secret set EC2_HOST            --env production --body '<ec2-public-dns>'
+gh secret set EC2_USER            --env production --body 'ubuntu'
+gh secret set EC2_SSH_PRIVATE_KEY --env production < ~/.ssh/<ec2-deploy-key>
+gh secret set EC2_KNOWN_HOSTS     --env production \
+  --body "$(ssh-keyscan -H <ec2-public-dns> 2>/dev/null)"
+```
+
+The deploy stops rather than overwrite tracked files edited directly on the server, and stops if the pulled checkout has CRLF line endings or a script that lost its executable bit. Commit through Git instead of letting the live and local copies drift.
+
+A push deploys with the `scripts/deploy.sh` already on the server, which then pulls. A change to the script itself therefore takes effect from the deploy after the one that ships it.
+
+## To try it
+
+With the service running locally (see [Deploying Locally](#deploying-locally)):
+
+```bash
+KEY=$(grep '^API_KEYS=' .env | cut -d= -f2 | cut -d, -f1)
+
+curl -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"url":"https://example.com"}' -o page.png localhost:3088/render
+```
+
+Through the local proxy, use `render.localhost:8085/render` instead. For a PDF send `'{"url":"...","format":"pdf"}'`, or use `"format":"html"` for the rendered HTML.
 
 ## API
 
@@ -141,30 +247,49 @@ Chromium is started at boot, so a broken install fails immediately rather than o
 
 ## Security
 
-- **SSRF.** All of Chromium's traffic goes through a small proxy inside the service. The proxy resolves each hostname itself, refuses anything that isn't a public unicast address (localhost, RFC 1918, link-local / cloud metadata, CGNAT, IPv6 ULA, ...), and then connects to exactly the address it checked. This covers redirects, subresources, iframes, fetch, WebSockets and DNS-rebinding tricks; `page.route` checks miss several of these. WebRTC UDP and QUIC are disabled so nothing bypasses the proxy. Set `ALLOW_PRIVATE_NETWORKS=true` only if you need to render intranet pages and trust every key holder.
-- **Defence in depth.** For a second layer, block the container's outbound traffic to private ranges at the host firewall (Docker's `DOCKER-USER` iptables chain). Make sure you don't also block the compose network itself, or Caddy won't be able to reach the API.
-- **Keys** are compared in constant time. Use long random ones, and HTTPS (the Caddy profile) whenever the service is reachable over a network.
+- **SSRF.** All of Chromium's traffic goes through a small proxy inside the service. The proxy resolves each hostname itself, refuses anything that isn't a public unicast address (localhost, RFC 1918, link-local / cloud metadata, CGNAT, IPv6 ULA, ...), and then connects to exactly the address it checked. This covers redirects, subresources, iframes, fetch, WebSockets and DNS-rebinding tricks; `page.route` checks miss several of these. WebRTC UDP and QUIC are disabled so nothing bypasses the proxy. That also keeps pages away from the other containers on `traefik-public`. Set `ALLOW_PRIVATE_NETWORKS=true` only if you need to render intranet pages and trust every key holder.
+- **Defence in depth.** For a second layer, block the container's outbound traffic to private ranges at the host firewall (Docker's `DOCKER-USER` iptables chain). Make sure you don't also block the Docker networks the container sits on, or Traefik (or your own TLS terminator) won't be able to reach the API.
+- **Keys** are compared in constant time. Use long random ones, and HTTPS whenever the service is reachable over a network: the hobby-traefik path provides it, and standalone LIVE needs a terminator in front.
 - **`headers`** are only attached to requests for the target URL's origin, so an `Authorization` header doesn't leak to third-party scripts or CDNs. Cookies follow normal browser scoping.
 - **Container.** It runs as a non-root user with a read-only filesystem, all capabilities dropped and `no-new-privileges`. Chromium's own sandbox is off by default (Playwright's default in Docker, because it needs user namespaces). If your host allows it, set `CHROMIUM_SANDBOX=true` and run with [Playwright's seccomp profile](https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json).
 
 ## Configuration
 
+Set these in `.env`. Blank or absent means the default.
+
 | Variable | Default | |
 |---|---|---|
-| `API_KEYS` | (required) | Comma-separated, each at least 16 characters |
-| `PORT` | `3000` | Port inside the container |
-| `RENDER_PORT` | `3000` | Host port (docker compose) |
+| `API_KEYS` | (required) | Comma-separated, each at least 16 characters. Compose refuses to start without it |
+| `APP_BIND` | `127.0.0.1` | Host address the API is published on, standalone only. `0.0.0.0` for standalone LIVE |
+| `APP_PORT` | `3088` | Host port, standalone only. `80` for standalone LIVE |
+| `APP_HOST` | (required with Traefik) | Hostname Traefik routes to the API, e.g. `render.localhost` locally |
 | `MAX_CONCURRENCY` | `2` | Renders in parallel. Chromium idles at about 400 MB; each heavy page can add several hundred MB more. |
 | `MAX_QUEUE` | `20` | Requests that may wait for a slot before getting 503 |
-| `JOB_TIMEOUT_MS` | `60000` | Hard limit per render (excluding queue time) |
+| `JOB_TIMEOUT_MS` | `60000` | Hard limit per render (excluding queue time). Raising it means raising `stop_grace_period` in `docker-compose.yml` too, or a deploy cuts off the longest renders |
 | `NAVIGATION_TIMEOUT_MS` | `30000` | Limit for the initial page load |
 | `MAX_IMAGE_HEIGHT` | `32768` | Upper bound for `maxHeight` |
 | `MAX_CAPTURE_HEIGHT` | `100000` | Most CSS pixels of a page ever captured |
 | `BROWSER_RECYCLE_AFTER` | `200` | Restart Chromium after this many renders |
-| `IDLE_SHUTDOWN_MS` | `60000` | Close Chromium after this long without renders; the next request starts it again (see below). `0` keeps it running. |
+| `IDLE_SHUTDOWN_MS` | `60000` | Close Chromium after this long without renders; the next request starts it again (see [Idle memory](#idle-memory)). `0` keeps it running. |
 | `CHROMIUM_SANDBOX` | `false` | See Security |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | See Security |
 | `LOG_LEVEL` | `info` | |
+| `PORT` | `3000` | Port inside the container. Fixed at 3000 by `docker-compose.yml`; only matters when running outside Docker |
+
+## Operating it
+
+```bash
+docker compose logs -f render                 # standalone
+docker compose ps
+```
+
+Add `-f docker-compose.yml -f docker-compose.traefik.yml` (plus `-f docker-compose.prod.yml` on the server) to operate a Traefik-integrated stack. The scripts pass those explicitly so Compose never merges the standalone override in by accident. Container names change on every LIVE deploy (`playwright-render-1`, then `-2`, ...), so always go through `docker compose ... logs render` rather than a container name.
+
+Nothing is stored: there are no volumes and nothing to back up.
+
+During a LIVE deploy the old and new releases run side by side for up to half a minute, plus however long the old one's in-flight renders take. Leave memory for two containers, each capped at 2 GB by `mem_limit`.
+
+`GET /healthz` is the health check the container and deploys rely on. It does not launch Chromium, so it does not stop an idle browser from shutting down.
 
 ## Development
 

@@ -1,7 +1,11 @@
+.git
+.github
+.idea
 node_modules
 test
-.env
-.git
+scripts
 *.md
-Caddyfile
-docker-compose.yml
+.env
+.env.*
+docker-compose*.yml
+Dockerfile
